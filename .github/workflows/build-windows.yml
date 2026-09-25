@@ -1,0 +1,116 @@
+name: Build Windows Package
+
+# 触发方式刻意只保留两种，避免同一次提交重复出包浪费 CI 时间：
+#   1. 推送版本 tag（如 v1.0.0）→ 构建 + 自动创建 Release 并附上 exe
+#   2. 手动触发（Actions 页面 Run workflow）→ 只构建并上传 Artifact
+# 普通 push 不会触发打包。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# 需要 contents: write 才能在 tag 构建时创建 Release 并上传附件
+permissions:
+  contents: write
+
+# 同一分支/tag 上旧的构建自动取消，省额度
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & Verify (Windows)
+    # electron-builder --win 必须在 Windows runner 上跑；
+    # Linux runner 需要额外装 Wine，稳定性差，不要换。
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    env:
+      # 显式关闭代码签名：CI 没有证书，若让它去尝试下载/签名工具，
+      # 既可能超时失败，也可能给产物打上不该有的标记。
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        # 用 npm ci 严格按 package-lock.json 安装，保证 CI 与本地一致
+        run: npm ci
+
+      - name: Rebuild native modules for Electron
+        # 关键步骤：better-sqlite3 是原生模块，npm ci 装出的是「系统 Node」的二进制，
+        # 必须针对 Electron 的 ABI 重新编译/下载预编译包，否则 exe 能打包成功但一运行就崩。
+        # 说明：install-app-deps 只支持 --platform / --arch 参数（不要加 --only，会被静默忽略）；
+        # 它会自动跳过没有 node-gyp 构建目标的包（如按平台分发的 @ffmpeg-installer/ffmpeg）。
+        # 这里的 postinstall 已经跑过一次，此处显式再跑一次作为兜底，且幂等。
+        run: npm run rebuild:native
+
+      - name: Verify tag matches package.json version
+        # 防止出现 v1.2.0 的 tag 打出 1.0.0 的包这种低级事故
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          $tagVersion = $env:TAG_NAME.TrimStart('v')
+          $pkgVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          Write-Host "tag=$tagVersion  package.json=$pkgVersion"
+          if ($tagVersion -ne $pkgVersion) {
+            Write-Error "版本号不一致：tag 是 $tagVersion，package.json 是 $pkgVersion。请先同步版本号再打 tag。"
+            exit 1
+          }
+
+      - name: Build frontend & package
+        # dist 脚本 = vite build && electron-builder --win
+        # dist/ 被 .gitignore 忽略，所以必须先构建，electron-builder 的 files 才能取到前端资源
+        run: npm run dist
+
+      - name: Smoke test packaged app
+        # 启动免安装产物，探测 /api/health 与前端入口；
+        # 这一步是「原生产物真能跑」的唯一硬校验，不要删。
+        run: node scripts/ci-smoke-test.js
+
+      - name: Collect deliverables
+        # 只取面向用户的 exe + electron-updater 所需的 latest.yml，
+        # 不把体积巨大的 win-unpacked/ 目录塞进上传列表
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging | Out-Null
+          # 用 -Path 而非 Copy-Item 通配符，避免 "no files to copy" 类静默失败
+          Get-ChildItem -Path release -Filter *.exe -File | Copy-Item -Destination staging -Force
+          Get-ChildItem -Path release -Filter latest.yml -File | Copy-Item -Destination staging -Force
+          Write-Host "--- staging ---"
+          Get-ChildItem staging | Select-Object Name, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}} | Format-Table -AutoSize
+          if (-not (Get-ChildItem staging -Filter *.exe -File)) {
+            Write-Error "release/ 下没有生成任何 exe，请检查 package.json 的 build.win 配置。"
+            exit 1
+          }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: PopDownloader-Windows-${{ github.ref_type == 'tag' && github.ref_name || github.run_number }}
+          path: staging/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        # 仅 tag 触发时执行，把 exe 作为 Release 附件发布
+        # （exe 远超 GitHub 单文件 100MB 入库限制，所以走 Release 附件而非提交进仓库）
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: PopDownloader ${{ github.ref_name }}
+          files: staging/*
+          fail_on_unmatched_files: true
+          generate_release_notes: false
