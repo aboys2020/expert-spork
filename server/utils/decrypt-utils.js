@@ -88,12 +88,38 @@ function aesCtrDecrypt(key, iv, encrypted) {
   return Buffer.concat([decipher.update(encrypted), decipher.final()])
 }
 
+/**
+ * 读取 box 内的 UInt32，越界时抛出可定位的错误。
+ *
+ * 为什么需要：Buffer.readUInt32BE 越界时只会抛
+ * "Attempt to access memory outside buffer bounds"，既不知道是哪个 box，
+ * 也不知道要读多少字节，排查成本极高（真实案例：某 lossless 曲目下载失败，
+ * 只给出这一句，无法定位到 stsz/senc）。
+ */
+function readUInt32Checked(data, offset, boxName) {
+  if (!Buffer.isBuffer(data) || offset + 4 > data.length) {
+    throw new Error(
+      `${boxName} 解析失败：需要读取偏移 ${offset} 处的 4 字节，但该 box 只有 ${data ? data.length : 0} 字节` +
+        '（box 可能被截断，或该曲目的容器格式与预期不符）',
+    )
+  }
+  return data.readUInt32BE(offset)
+}
+
 function parseStsz(data) {
-  const sampleSize = data.readUInt32BE(4)
-  const count = data.readUInt32BE(8)
+  const sampleSize = readUInt32Checked(data, 4, 'stsz')
+  const count = readUInt32Checked(data, 8, 'stsz')
 
   if (sampleSize !== 0) {
     return Array.from({ length: count }, () => sampleSize)
+  }
+
+  // 逐条样本表：共 count 条，每条 4 字节，起始于偏移 12
+  const tableEnd = 12 + count * 4
+  if (tableEnd > data.length) {
+    throw new Error(
+      `stsz 解析失败：声明 ${count} 条样本需要 ${tableEnd} 字节，但该 box 只有 ${data.length} 字节`,
+    )
   }
 
   const sizes = []
@@ -105,7 +131,16 @@ function parseStsz(data) {
 }
 
 function parseStsc(data) {
-  const entryCount = data.readUInt32BE(4)
+  const entryCount = readUInt32Checked(data, 4, 'stsc')
+
+  // 每项 12 字节，起始于偏移 8
+  const tableEnd = 8 + entryCount * 12
+  if (tableEnd > data.length) {
+    throw new Error(
+      `stsc 解析失败：声明 ${entryCount} 项需要 ${tableEnd} 字节，但该 box 只有 ${data.length} 字节`,
+    )
+  }
+
   const entries = []
 
   for (let index = 0; index < entryCount; index += 1) {
@@ -121,15 +156,26 @@ function parseStsc(data) {
 }
 
 function parseSenc(data) {
-  const count = data.readUInt32BE(4)
+  const count = readUInt32Checked(data, 4, 'senc')
+
+  // 默认 IV 为 8 字节；每项可能还带 2 字节 subsample 计数 + 6 字节子样本数据，
+  // 这里按最常见的 8 字节 IV 计算最小需求量。
+  const ivSize = 8
+  const minEnd = 8 + count * ivSize
+  if (minEnd > data.length) {
+    throw new Error(
+      `senc 解析失败：声明 ${count} 个 IV 至少需要 ${minEnd} 字节，但该 box 只有 ${data.length} 字节`,
+    )
+  }
+
   const ivs = []
   let position = 8
 
   for (let index = 0; index < count; index += 1) {
     const iv = Buffer.alloc(16)
-    data.copy(iv, 0, position, position + 8)
+    data.copy(iv, 0, position, position + ivSize)
     ivs.push(iv)
-    position += 8
+    position += ivSize
   }
 
   return ivs
@@ -140,6 +186,11 @@ function scanForFlacMetadata(stsdData) {
   const index = stsdData.indexOf(marker)
 
   if (index === -1 || index < 4) {
+    return Buffer.alloc(0)
+  }
+
+  // index >= 4 已保证这里不会越界，但仍然显式校验一次，避免后续改动破坏该前提
+  if (index - 4 + 4 > stsdData.length) {
     return Buffer.alloc(0)
   }
 

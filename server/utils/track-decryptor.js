@@ -28,6 +28,20 @@ class TrackDecryptor {
   }
 
   decryptSampleList({ fileBuffer, key, sampleSizes, ivs, mdatOffset }) {
+    const totalSampleBytes = sampleSizes.reduce((sum, size) => sum + size, 0)
+    const availableBytes = fileBuffer.length - (mdatOffset + 8)
+
+    // 关键校验：先算出所有样本需要的总字节数，和 mdat 里实际可用的字节数对比。
+    // 若不校验，subarray 越界会静默截断，解密出来的文件看似正常实则损坏
+    // （比抛错更难排查），同时后面 Buffer.copy 也可能越界。
+    if (totalSampleBytes > availableBytes) {
+      throw new Error(
+        `音频数据不完整：样本表声明共 ${totalSampleBytes} 字节，` +
+          `但媒体数据区只有 ${availableBytes} 字节（差了 ${totalSampleBytes - availableBytes} 字节）。` +
+          '可能是下载被截断，或该曲目的容器结构与预期不符（例如分片 MP4 需要不同的解析方式）。',
+      )
+    }
+
     const decryptedSamples = []
     let sampleOffset = mdatOffset + 8
 
@@ -112,6 +126,15 @@ class TrackDecryptor {
 
     const flacMetadata = scanForFlacMetadata(stsd.data)
     const isFlac = flacMetadata.length > 0
+
+    // stco 为空会导致后续 readUInt32BE 直接抛 "Attempt to access memory outside buffer bounds"，
+    // 这里提前给出可定位的报错。
+    if (stco.isEmpty() || stco.data.length < 8) {
+      throw new Error(
+        "Decrypt failed: 'stco' atom 缺失或过短（无法确定 chunk 偏移表）。" +
+          '通常说明该曲目的容器结构与预期不符。',
+      )
+    }
 
     const sampleSizes = parseStsz(stsz.data)
     const stscEntries = parseStsc(stsc.data)
