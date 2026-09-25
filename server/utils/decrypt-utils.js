@@ -236,28 +236,77 @@ function parseSenc(data) {
   return ivs
 }
 
+/**
+ * 从 stsd 里提取 FLAC 的 metadata 块链（不含 dfLa 的 version/flags）。
+ *
+ * dfLa box 的真实结构（已用真实曲目逐字节验证）：
+ *   [0..3]   box size
+ *   [4..7]   'dfLa'
+ *   [8..11]  version(1) + flags(3)   ← 必须跳过，它不是 FLAC 块头
+ *   [12..]   FLAC metadata 块链（每块 4 字节头：1 字节 isLast+type，3 字节长度）
+ *
+ * 曾经的 bug：把 version/flags 当成 FLAC 块头（解析出 type=0 len=0 的空块），
+ * 且 buildFlacFile 又额外切掉 4 字节，导致拼出的 FLAC 头部错位，
+ * 最终 flac-tagger 按错误的长度跳到音频数据里解析并越界崩溃
+ * （报错正是 "Attempt to access memory outside buffer bounds"，且只有 lossless 受影响）。
+ */
 function scanForFlacMetadata(stsdData) {
-  const marker = Buffer.from([0x64, 0x66, 0x4c, 0x61])
+  const marker = Buffer.from([0x64, 0x66, 0x4c, 0x61]) // 'dfLa'
   const index = stsdData.indexOf(marker)
 
   if (index === -1 || index < 4) {
     return Buffer.alloc(0)
   }
 
-  // index >= 4 已保证这里不会越界，但仍然显式校验一次，避免后续改动破坏该前提
-  if (index - 4 + 4 > stsdData.length) {
-    return Buffer.alloc(0)
-  }
-
   const boxSize = stsdData.readUInt32BE(index - 4)
-  const contentStart = index + 4
-  const contentEnd = Math.min(index - 4 + boxSize, stsdData.length)
+  const boxEnd = Math.min(index - 4 + boxSize, stsdData.length)
 
-  if (contentEnd <= contentStart) {
+  // index 指向 'dfLa'，其后的 4 字节是 version/flags，元数据从 index+8 起
+  const blocksStart = index + 8
+  if (blocksStart >= boxEnd) {
     return Buffer.alloc(0)
   }
 
-  return stsdData.subarray(contentStart, contentEnd)
+  return stsdData.subarray(blocksStart, boxEnd)
+}
+
+/**
+ * 校验 metadata 块链是否自洽：每块 4 字节头 + 声明的长度必须落在给定范围内。
+ * 返回 { ok, blockCount, endOffset, reason }。
+ */
+function inspectFlacBlockChain(blocks) {
+  let position = 0
+  let blockCount = 0
+
+  while (position + 4 <= blocks.length) {
+    const header = blocks[position]
+    const isLast = (header & 0x80) !== 0
+    const blockLength = (blocks[position + 1] << 16) | (blocks[position + 2] << 8) | blocks[position + 3]
+    const next = position + 4 + blockLength
+
+    if (next > blocks.length) {
+      return {
+        ok: false,
+        blockCount,
+        endOffset: position,
+        reason: `第 ${blockCount} 个 metadata 块声明长度 ${blockLength}，需要到偏移 ${next}，但只有 ${blocks.length} 字节`,
+      }
+    }
+
+    blockCount += 1
+    position = next
+
+    if (isLast) {
+      return { ok: true, blockCount, endOffset: position }
+    }
+  }
+
+  return {
+    ok: false,
+    blockCount,
+    endOffset: position,
+    reason: `metadata 块链没有以 isLast 标记结束（已解析 ${blockCount} 块，停在偏移 ${position}）`,
+  }
 }
 
 function replaceEncaWithMp4a(buffer, searchStart, searchEnd) {
@@ -284,6 +333,7 @@ module.exports = {
   aesCtrDecrypt,
   decryptSpadeA,
   hexToBuffer,
+  inspectFlacBlockChain,
   parseSenc,
   parseStsc,
   parseStsz,

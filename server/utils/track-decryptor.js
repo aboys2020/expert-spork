@@ -3,6 +3,7 @@ const {
   aesCtrDecrypt,
   decryptSpadeA,
   hexToBuffer,
+  inspectFlacBlockChain,
   parseSenc,
   parseStsc,
   parseStsz,
@@ -61,13 +62,46 @@ class TrackDecryptor {
     return decryptedSamples
   }
 
+  /**
+   * 拼装标准 FLAC 文件：'fLaC' 签名 + metadata 块链 + 音频帧。
+   *
+   * 为什么必须补一个 PADDING 块：
+   *   flac-tagger 的 header.js 里 isLast 判定写错了 ——
+   *     isLast: (lastAndType & 0b10000000) === 1
+   *   & 128 的结果不可能是 1，所以它永远认不出「最后一块」，
+   *   只能靠读到 type=127(Invalid) 才停止遍历。
+   *   当 metadata 只有 STREAMINFO 一个块时（本曲目的 dfLa 就是如此），
+   *   它会顺着音频帧继续当元数据解析，最终越界抛出
+   *     "Attempt to access memory outside buffer bounds"  ← 用户实际遇到的报错
+   *
+   * 补一个 PADDING 块既是 FLAC 编码器的常规做法，也能让上述库正确终止遍历。
+   * 注意若原块已带 isLast 标记，必须先清掉，否则会出现两个「最后一块」。
+   */
   buildFlacFile(flacMetadata, decryptedSamples) {
     const flacSignature = Buffer.from('fLaC')
-    const metadataBody = flacMetadata.length > 4
-      ? flacMetadata.subarray(4)
-      : flacMetadata
 
-    return Buffer.concat([flacSignature, metadataBody, ...decryptedSamples])
+    const blocks = Buffer.from(flacMetadata)
+    if (blocks.length >= 4) {
+      // 清除第一个块头里的 isLast 位（bit7）
+      blocks[0] = blocks[0] & 0x7f
+    }
+
+    // PADDING 块：1 字节头（isLast=1, type=1）+ 3 字节长度 + 数据
+    const paddingBody = Buffer.alloc(4096)
+    const paddingHeader = Buffer.from([
+      0x81, // isLast = 1, type = 1 (PADDING)
+      (paddingBody.length >> 16) & 0xff,
+      (paddingBody.length >> 8) & 0xff,
+      paddingBody.length & 0xff,
+    ])
+
+    return Buffer.concat([
+      flacSignature,
+      blocks,
+      paddingHeader,
+      paddingBody,
+      ...decryptedSamples,
+    ])
   }
 
   buildM4aFile(fileBuffer, decryptedSamples, mdat, stsd) {
@@ -126,6 +160,19 @@ class TrackDecryptor {
 
     const flacMetadata = scanForFlacMetadata(stsd.data)
     const isFlac = flacMetadata.length > 0
+
+    // FLAC 路径的前置校验：metadata 块链必须自洽，否则下游 flac-tagger 会
+    // 按错误的长度跳到音频数据里解析，抛出难以定位的
+    // "Attempt to access memory outside buffer bounds"。
+    if (isFlac) {
+      const chain = inspectFlacBlockChain(flacMetadata)
+      if (!chain.ok) {
+        throw new Error(
+          `FLAC metadata 块链不完整：${chain.reason}。` +
+            '（这将导致写标签阶段越界崩溃，故提前拦截）',
+        )
+      }
+    }
 
     // stco 为空会导致后续 readUInt32BE 直接抛 "Attempt to access memory outside buffer bounds"，
     // 这里提前给出可定位的报错。

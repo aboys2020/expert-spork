@@ -165,6 +165,14 @@ jobs:
         # 导致 require('archiver') 报 Cannot find module，坏包直接发给了用户。
         run: node scripts/audit-asardeps.js
 
+      - name: FLAC metadata regression test
+        # 离线回归测试，锁定一个真实发生过的用户可见故障：
+        # flac-tagger@2.0.0 的 isLast 判定有 bug，遇到「只有 STREAMINFO 元数据块」的
+        # FLAC 会顺着音频帧继续解析并越界崩溃（Attempt to access memory outside buffer bounds），
+        # 表现为「同一首歌 lossless 下载失败、其他音质正常」。
+        # 现已改为自实现标签写入，本测试确保该场景始终可用。
+        run: node scripts/ci-flac-metadata-test.js
+
       - name: Collect deliverables
         # 只取面向用户的 exe + electron-updater 所需的 latest.yml，
         # 不把体积巨大的 win-unpacked/ 目录塞进上传列表

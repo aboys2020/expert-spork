@@ -301,7 +301,7 @@ async function diagnoseTrackMedia({ sessionid, track_id, aid = fixed.aid, qualit
   const report = []
   // 每采集完一个音质就回调一次，便于调用方即时落盘（中途失败也能留下已完成部分）
   const push = (entry) => {
-    push(entry)
+    report.push(entry)
     if (typeof onProgress === 'function') {
       try {
         onProgress(entry)

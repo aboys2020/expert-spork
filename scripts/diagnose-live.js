@@ -63,6 +63,36 @@ const appRootInfo = resolveAppRoot()
 const APP_ROOT = appRootInfo.root
 
 /**
+ * 选择要加载的 server/utils 目录。
+ *
+ * 默认用应用包内的（app.asar），保证诊断的就是真实发布产物。
+ * 但另提供 DIAG_USE_LOCAL_SERVER=true 走「脚本所在仓库的 server 目录」，
+ * 这样改完代码不必重新打包装机就能验证 —— 排查阶段能省掉大量来回。
+ * 注意：该模式下 server 的依赖仍需可解析，所以仓库需要装好 node_modules，
+ * 或把它们的 node_modules 一并放在可解析的位置。
+ */
+const USE_LOCAL_SERVER = process.env.DIAG_USE_LOCAL_SERVER === 'true'
+const SERVER_ROOT = USE_LOCAL_SERVER ? path.join(__dirname, '..') : APP_ROOT
+
+/**
+ * 本地模式下的依赖解析：代码取自仓库，依赖取自应用包内。
+ * 必须在加载任何 server 模块「之前」执行，否则第一个 require 就会失败。
+ * 仓库通常没有 node_modules，而 app.asar 里有完整的生产依赖，
+ * 把后者加入模块搜索路径即可两全其美：能立刻验证新代码，又不必重新打包。
+ */
+if (USE_LOCAL_SERVER && APP_ROOT) {
+  const extra = [
+    path.join(APP_ROOT, 'node_modules', 'electron', 'node_modules'),
+    path.join(APP_ROOT, 'node_modules'),
+  ]
+  for (const p of extra) {
+    if (!module.paths.includes(p)) {
+      module.paths.unshift(p)
+    }
+  }
+}
+
+/**
  * 参数解析：兼容两种写法，避免因空字符串被当成「未提供」而误判。
  *   diagnose-live.js <track_id>
  *   diagnose-live.js <sessionid> <track_id>
@@ -108,9 +138,9 @@ function resolveSessionId() {
     return { value: sessionId, source: '命令行参数' }
   }
   try {
-    // 关键：从应用包内加载，而不是从本脚本所在的仓库目录加载
-    const cookieModulePath = APP_ROOT
-      ? path.join(APP_ROOT, 'server', 'utils', 'sodamusic-cookie.js')
+    // 关键：从选定的 server 根目录加载，而不是依赖相对脚本的解析
+    const cookieModulePath = SERVER_ROOT
+      ? path.join(SERVER_ROOT, 'server', 'utils', 'sodamusic-cookie.js')
       : ''
     const { getSessionIdFromSodaMusicCookies } = cookieModulePath
       ? require(cookieModulePath)
@@ -177,8 +207,7 @@ async function viaHttp() {
 }
 
 async function viaModule() {
-  // 同样必须从应用包内加载模块，理由见 resolveAppRoot 注释
-  const trackModulePath = APP_ROOT ? path.join(APP_ROOT, 'server', 'utils', 'track-download.js') : ''
+  const trackModulePath = SERVER_ROOT ? path.join(SERVER_ROOT, 'server', 'utils', 'track-download.js') : ''
   const { diagnoseTrackMedia } = trackModulePath
     ? require(trackModulePath)
     : require('../server/utils/track-download')
@@ -218,6 +247,7 @@ async function main() {
 
   console.log(`track_id=${trackId}`)
   console.log(`应用根路径: ${APP_ROOT || '(未定位到，将回退到脚本所在目录)'}${appRootInfo.source ? `  [${appRootInfo.source}]` : ''}`)
+  console.log(`代码来源: ${USE_LOCAL_SERVER ? '仓库 server 目录（DIAG_USE_LOCAL_SERVER=true）' : '应用包内 app.asar'}`)
   console.log(`sessionid 来源：${resolved.source}`)
   console.log('开始诊断（会依次下载该曲目全部音质用于分析，不写出音频文件）...')
 
