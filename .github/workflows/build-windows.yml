@@ -54,7 +54,42 @@ jobs:
         # 用 npm ci 严格按 package-lock.json 安装，保证 CI 与本地一致。
         # 注意：package.json 里已不含 postinstall，这一步不会触发原生模块重编译，
         # 避免在「装依赖」阶段就因工具链问题中断，把失败点收敛到下面的专用步骤。
-        run: npm ci
+        #
+        # 为什么要重试：npm ci 期间 electron 的 install.js 要从 GitHub 下载约 115MB 的
+        # Electron 二进制，该端点会偶发 500/超时（已实际遇到过一次：
+        # "HTTPError: Response code 500" 导致整步失败）。这是纯网络抖动，
+        # 不是配置问题，也不该让整次构建白跑，所以自动重试。
+        # 同时把「package.json 与 package-lock.json 不同步」提前拦住：
+        # 否则失败信息会伪装成 "npm ci can only install packages when your package.json
+        # and package-lock.json are in sync"，很容易误判成网络问题。
+        shell: pwsh
+        run: |
+          Write-Host "--- 检查 package.json 与 package-lock.json 是否同步 ---"
+          $before = (Get-FileHash package-lock.json -Algorithm SHA256).Hash
+          $maxAttempts = 3
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            Write-Host "--- npm ci（第 $attempt / $maxAttempts 次尝试）---"
+            npm ci
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "npm ci 成功"
+              exit 0
+            }
+            $after = (Get-FileHash package-lock.json -Algorithm SHA256).Hash
+            if ($after -ne $before) {
+              Write-Error @'
+          npm ci 修改了 package-lock.json，说明它与 package.json 不同步。
+          请在本地执行一次 npm install 更新锁文件，并把 package-lock.json 一起提交。
+          （不要用 npm ci 来修复它，那不会重新生成锁文件。）
+          '@
+              exit 1
+            }
+            Write-Warning "npm ci 第 $attempt 次失败（很可能是 Electron 二进制下载抖动）"
+            if ($attempt -lt $maxAttempts) {
+              Start-Sleep -Seconds 10
+            }
+          }
+          Write-Error "npm ci 连续 $maxAttempts 次失败，请查看上方日志确认原因。"
+          exit 1
 
       - name: Rebuild native modules for Electron
         # better-sqlite3 是原生模块，npm ci 拿到的是「系统 Node」的二进制，
