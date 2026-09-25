@@ -24,6 +24,45 @@ const fs = require('fs')
 const path = require('path')
 
 /**
+ * 定位「应用自身的根路径」，用它来 require 应用包内的模块。
+ *
+ * 为什么必须这样：本脚本放在仓库里（普通目录），而脚本里的相对 require
+ * 是相对「脚本文件」解析的，会指到仓库的 server/ 去 ——
+ * 那里通常没有装 node_modules，于是报 Cannot find module 'better-sqlite3'。
+ * 正确做法是显式指向打包后的应用（app.asar），即真实运行时用的那份代码。
+ */
+function resolveAppRoot() {
+  // 方式 1：Electron 的 app.getAppPath()
+  try {
+    const electron = require('electron')
+    const p = electron && electron.app && typeof electron.app.getAppPath === 'function'
+      ? electron.app.getAppPath()
+      : ''
+    if (p) {
+      return { root: p, source: 'app.getAppPath()' }
+    }
+  } catch {}
+
+  // 方式 2：从可执行文件路径推导，形如 <root>\resources\app.asar 或 <root>\resources\app
+  try {
+    const exeDir = path.dirname(process.execPath)
+    const asar = path.join(exeDir, 'resources', 'app.asar')
+    if (fs.existsSync(asar)) {
+      return { root: asar, source: 'process.execPath → resources/app.asar' }
+    }
+    const appDir = path.join(exeDir, 'resources', 'app')
+    if (fs.existsSync(appDir)) {
+      return { root: appDir, source: 'process.execPath → resources/app' }
+    }
+  } catch {}
+
+  return { root: '', source: '' }
+}
+
+const appRootInfo = resolveAppRoot()
+const APP_ROOT = appRootInfo.root
+
+/**
  * 参数解析：兼容两种写法，避免因空字符串被当成「未提供」而误判。
  *   diagnose-live.js <track_id>
  *   diagnose-live.js <sessionid> <track_id>
@@ -69,7 +108,13 @@ function resolveSessionId() {
     return { value: sessionId, source: '命令行参数' }
   }
   try {
-    const { getSessionIdFromSodaMusicCookies } = require('../server/utils/sodamusic-cookie')
+    // 关键：从应用包内加载，而不是从本脚本所在的仓库目录加载
+    const cookieModulePath = APP_ROOT
+      ? path.join(APP_ROOT, 'server', 'utils', 'sodamusic-cookie.js')
+      : ''
+    const { getSessionIdFromSodaMusicCookies } = cookieModulePath
+      ? require(cookieModulePath)
+      : require('../server/utils/sodamusic-cookie')
     const result = getSessionIdFromSodaMusicCookies()
     if (result && result.supported && result.sessionid) {
       return { value: result.sessionid, source: '本机汽水音乐 Cookies（同「一键登录」）' }
@@ -132,7 +177,11 @@ async function viaHttp() {
 }
 
 async function viaModule() {
-  const { diagnoseTrackMedia } = require('../server/utils/track-download')
+  // 同样必须从应用包内加载模块，理由见 resolveAppRoot 注释
+  const trackModulePath = APP_ROOT ? path.join(APP_ROOT, 'server', 'utils', 'track-download.js') : ''
+  const { diagnoseTrackMedia } = trackModulePath
+    ? require(trackModulePath)
+    : require('../server/utils/track-download')
   const result = await diagnoseTrackMedia({
     sessionid: sessionId,
     track_id: trackId,
@@ -168,6 +217,7 @@ async function main() {
   sessionId = resolved.value
 
   console.log(`track_id=${trackId}`)
+  console.log(`应用根路径: ${APP_ROOT || '(未定位到，将回退到脚本所在目录)'}${appRootInfo.source ? `  [${appRootInfo.source}]` : ''}`)
   console.log(`sessionid 来源：${resolved.source}`)
   console.log('开始诊断（会依次下载该曲目全部音质用于分析，不写出音频文件）...')
 
