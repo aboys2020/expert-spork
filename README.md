@@ -198,11 +198,25 @@ git push origin HEAD --tags
 
 工作流会自动完成：`npm ci` → 初始化 MSVC 环境 → 为 Electron 重建 `better-sqlite3`
 （优先取预编译包，取不到再源码编译）→ `vite build` → `electron-builder --win --publish never` →
-**启动打好的 exe 做冒烟测试**（探测 `/api/health` 与前端入口，防止打出能编译但一打开就崩的包）
-→ 上传产物。
+**两阶段冒烟测试**（见下）→ 上传产物。
 
 > 注意：exe 体积接近百 MB，超过 GitHub 单文件 100MB 的入库限制，
 > 所以产物只作为 Release 附件 / Artifact 分发，不要提交进仓库。
+
+#### 冒烟测试为什么分两阶段
+
+由 `scripts/ci-smoke-test.js` 驱动，目的是把「打包内容坏了」和「GUI 起不来」这两类
+完全不同的问题区分开，避免排查时互相误导：
+
+| 阶段 | 做什么 | 失败意味着 |
+| --- | --- | --- |
+| 1 | `ELECTRON_RUN_AS_NODE=1` 运行打包后的 exe，加载 `app.asar` 内的 `server/index.js` 并真正监听端口（`scripts/ci-runtime-probe.js`），**不需要 GUI** | 打包内容有问题：原生模块 ABI 不匹配、asar 遗漏、依赖缺失 —— **这是用户真会遇到的问题，必须修** |
+| 2 | 用 `--no-sandbox --disable-gpu` 启动 GUI 产物，探测 `/api/health` 与前端入口 | 打包内容没问题，卡在 GUI 启动环节（无头会话限制） |
+
+> ⚠️ **Windows 上 Electron 的 GUI 进程没有控制台，主进程里 `console.log` 的内容会被直接丢弃**，
+> 所以捕获 GUI 进程的 stdout/stderr 永远是空的、没有诊断价值。
+> 需要取证时设置环境变量 `SMOKE_HEARTBEAT=<文件路径>`，`electron/main.js` 会把启动关键节点
+> 写入该文件；不设置时这段诊断代码完全不执行，不影响正常运行。
 
 #### 三个容易踩的坑（均已修复，改动前请先看）
 

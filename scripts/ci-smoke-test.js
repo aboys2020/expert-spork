@@ -40,6 +40,7 @@ const LOG_DIR = path.join(os.tmpdir(), 'popdownloader-smoke')
 const PROBE_LOG = path.join(LOG_DIR, 'probe.log')
 const PROBE_RESULT = path.join(LOG_DIR, 'probe-result.txt')
 const GUI_LOG = path.join(LOG_DIR, 'gui.log')
+const HEARTBEAT_FILE = path.join(LOG_DIR, 'gui-heartbeat.log')
 
 function fail(message, extra) {
   console.error(`\n[smoke] ✗ ${message}`)
@@ -154,12 +155,17 @@ async function runRuntimeProbe() {
 async function runGuiCheck() {
   console.log('[smoke] ===== 阶段 2/2：启动 GUI 产物 =====')
   const logFd = fs.openSync(GUI_LOG, 'w')
+  fs.rmSync(HEARTBEAT_FILE, { force: true })
 
+  // 为什么要 HEARTBEAT：Windows 上 Electron 的 GUI 进程没有控制台，
+  // 主进程的 console.log 会被丢弃，所以捕获 stdout/stderr 永远是空的、毫无诊断价值。
+  // 改由主进程把启动关键节点写入 HEARTBEAT_FILE（electron/main.js 里的 heartbeat）。
   const child = spawn(EXE_PATH, ['--no-sandbox', '--disable-gpu'], {
     env: {
       ...process.env,
       PORT: String(GUI_PORT),
       ELECTRON_ENABLE_LOGGING: '1',
+      SMOKE_HEARTBEAT: HEARTBEAT_FILE,
     },
     stdio: ['ignore', logFd, logFd],
   })
@@ -178,57 +184,86 @@ async function runGuiCheck() {
       }
     } catch {}
   }
-  process.on('exit', cleanup)
 
-  const deadline = Date.now() + GUI_TIMEOUT_MS
-  let lastStatus = '未收到任何响应'
+  try {
+    const deadline = Date.now() + GUI_TIMEOUT_MS
+    let lastStatus = '未收到任何响应'
 
-  while (Date.now() < deadline) {
-    const health = await probeUrl(`${GUI_BASE}/api/health`)
-    if (health && health.ok) {
-      let payload = null
-      try {
-        payload = JSON.parse(health.body)
-      } catch {
-        fail(`/api/health 返回的不是 JSON：${health.body.slice(0, 200)}`)
-      }
-      // 不能只看 200：同端口若跑着别的服务会误判通过
-      if (payload.message !== 'PopDownloader local API is running') {
-        fail(`同端口上的服务不是本应用（message=${JSON.stringify(payload.message)}）。`)
-      }
-      if (String(payload.port) !== String(GUI_PORT)) {
-        fail(`health 回显端口 ${payload.port} 与期望的 ${GUI_PORT} 不一致，疑似连到了别的实例。`)
-      }
-      console.log(`[smoke] /api/health 通过：${JSON.stringify(payload)}`)
+    while (Date.now() < deadline) {
+      const health = await probeUrl(`${GUI_BASE}/api/health`)
+      if (health && health.ok) {
+        let payload = null
+        try {
+          payload = JSON.parse(health.body)
+        } catch {
+          fail(`/api/health 返回的不是 JSON：${health.body.slice(0, 200)}`)
+        }
+        // 不能只看 200：同端口若跑着别的服务会误判通过
+        if (payload.message !== 'PopDownloader local API is running') {
+          fail(`同端口上的服务不是本应用（message=${JSON.stringify(payload.message)}）。`)
+        }
+        if (String(payload.port) !== String(GUI_PORT)) {
+          fail(`health 回显端口 ${payload.port} 与期望的 ${GUI_PORT} 不一致，疑似连到了别的实例。`)
+        }
+        console.log(`[smoke] /api/health 通过：${JSON.stringify(payload)}`)
 
-      const index = await probeUrl(`${GUI_BASE}/`)
-      if (!index || !index.ok) {
-        fail(`后端存活但根路径不可访问（${index ? index.status : '无响应'}），dist 静态资源可能没打进包。`)
-      }
-      if (!/<!doctype html|<div id="app"/i.test(index.body)) {
-        fail('根路径返回的内容不像前端入口页，请检查 server/index.js 的 distPath 与打包 files 配置。')
+        const index = await probeUrl(`${GUI_BASE}/`)
+        if (!index || !index.ok) {
+          fail(`后端存活但根路径不可访问（${index ? index.status : '无响应'}），dist 静态资源可能没打进包。`)
+        }
+        if (!/<!doctype html|<div id="app"/i.test(index.body)) {
+          fail('根路径返回的内容不像前端入口页，请检查 server/index.js 的 distPath 与打包 files 配置。')
+        }
+
+        console.log('[smoke] ✓ 阶段 2 通过：GUI 产物启动正常，后端可用 + 前端资源完整')
+        cleanup()
+        process.exit(0)
       }
 
-      console.log('[smoke] ✓ 阶段 2 通过：GUI 产物启动正常，后端可用 + 前端资源完整')
-      cleanup()
-      process.exit(0)
+      if (health) {
+        lastStatus = `HTTP ${health.status}`
+      } else if (childExited) {
+        lastStatus = `进程已退出（${exitInfo}）`
+      }
+
+      await sleep(1500)
     }
 
-    if (health) {
-      lastStatus = `HTTP ${health.status}`
-    } else if (childExited) {
-      lastStatus = `进程已退出（${exitInfo}）`
+    const beat = readFileSafe(HEARTBEAT_FILE)
+    printSection('主进程心跳（GUI 进程无控制台，只能靠这个取证）', beat)
+    printSection('GUI 进程 stdout/stderr', readFileSafe(GUI_LOG))
+
+    // 根据心跳内容给出明确归因，避免下一次还要猜
+    let diagnosis = ''
+    if (!beat.trim()) {
+      diagnosis =
+        '心跳文件为空 ⇒ 主进程从未执行到 electron/main.js 第一行。\n' +
+        '    说明卡在 Electron 自身引导阶段（窗口子系统/GPU/沙箱初始化），与项目代码无关。'
+    } else if (!/app ready/.test(beat)) {
+      diagnosis =
+        '心跳停在 app ready 之前 ⇒ Electron 进入主进程但 app 一直没 ready，\n' +
+        '    通常是引导阶段被阻塞。'
+    } else if (!/BrowserWindow 已创建/.test(beat)) {
+      diagnosis = '心跳停在创建窗口 ⇒ 无头会话下 BrowserWindow 创建失败或阻塞。'
+    } else if (!/后端就绪|loadURL/.test(beat)) {
+      diagnosis =
+        '窗口已创建但后端始终未就绪 ⇒ 主进程内 Express 未能监听（端口占用或被阻塞）。'
+    } else {
+      diagnosis = '窗口已创建且已 loadURL，但接口不可达 ⇒ 问题在渲染/加载阶段。'
     }
 
-    await sleep(1500)
+    fail(
+      `等待 ${GUI_TIMEOUT_MS / 1000}s 后 GUI 产物仍未就绪（最后状态：${lastStatus}）。\n` +
+        `  归因：${diagnosis}\n` +
+        '  背景：阶段 1 已证明打包内容本身可用（asar 可加载、后端能监听、原生模块 ABI 正确），\n' +
+        '        因此这是「GUI 启动」环节的问题，不代表 exe 在真实桌面环境下不可用。',
+    )
+  } finally {
+    cleanup()
+    try {
+      fs.closeSync(logFd)
+    } catch {}
   }
-
-  printSection('GUI 进程输出', readFileSafe(GUI_LOG))
-  fail(
-    `等待 ${GUI_TIMEOUT_MS / 1000}s 后 GUI 产物仍未就绪（最后状态：${lastStatus}）。\n` +
-      '  注意：阶段 1 已证明打包内容本身可用，因此问题出在「GUI 启动」这一环\n' +
-      '        （无头会话、Electron 窗口创建失败、或主进程在窗口阶段阻塞）。',
-  )
 }
 
 async function main() {
