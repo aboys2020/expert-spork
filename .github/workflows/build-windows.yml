@@ -56,14 +56,6 @@ jobs:
         # 避免在「装依赖」阶段就因工具链问题中断，把失败点收敛到下面的专用步骤。
         run: npm ci
 
-      - name: Setup MSVC developer environment
-        # 显式初始化 VS x64 开发者环境（vcvars）。node-gyp 依赖它定位 MSVC 与 Windows SDK。
-        # 若 runner 上确实缺少 VS 构建工具，这一步会立刻给出明确报错，
-        # 而不是等到 node-gyp 深处才暴露。
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
       - name: Rebuild native modules for Electron
         # better-sqlite3 是原生模块，npm ci 拿到的是「系统 Node」的二进制，
         # 必须换成针对 Electron ABI 的版本，否则 exe 能打包成功但一运行就崩。
@@ -73,6 +65,14 @@ jobs:
         #   B. 若没有预编译包，再用 electron-builder install-app-deps 走 @electron/rebuild 源码编译
         # 最后以 B 的结果为准，因为 electron-builder 打包时自身也会做一次 rebuild，两者必须一致。
         # 说明：install-app-deps 只支持 --platform / --arch（不要加 --only，会被静默忽略）。
+        #
+        # 关于 MSVC：这里刻意不再用 ilammy/msvc-dev-cmd 初始化 vcvars。
+        # 原因：windows-2022 镜像自带 VS 2022，且实测 A 路线就能命中预编译包
+        # （日志里 preparing→finished 之间没有任何编译输出即证明），因此不需要它；
+        # 而该 action 只有 node20 版本，会持续产生 "Node.js 20 is deprecated" 警告。
+        # 若将来改动 Electron 版本导致退回源码编译、并报 node-gyp 找不到 VS，再加回来即可：
+        #   - uses: ilammy/msvc-dev-cmd@v1
+        #     with: { arch: x64 }
         shell: pwsh
         run: |
           $electronVersion = (Get-Content node_modules/electron/package.json -Raw | ConvertFrom-Json).version
@@ -123,6 +123,13 @@ jobs:
         #     若阶段 1 过、阶段 2 失败 ⇒ 问题在「GUI 启动」这一环，而非打包内容。
         run: node scripts/ci-smoke-test.js
 
+      - name: Audit asar runtime dependency closure
+        # 单独一道防线：解析 app.asar 内所有运行时包的依赖能否按 Node 规则解析到。
+        # 这能抓住「构建与启动都正常、只有点某个功能才崩」的坏包 ——
+        # 真实案例：zip-stream 在顶层而 archiver-utils 被挤进 archiver/node_modules，
+        # 导致 require('archiver') 报 Cannot find module，坏包直接发给了用户。
+        run: node scripts/audit-asardeps.js
+
       - name: Collect deliverables
         # 只取面向用户的 exe + electron-updater 所需的 latest.yml，
         # 不把体积巨大的 win-unpacked/ 目录塞进上传列表
@@ -140,7 +147,9 @@ jobs:
           }
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v5
+        # v6 运行在 node24 上，可消除 "Node.js 20 is deprecated" 警告
+        # （v4/v5 都是 node20；入参与 v5 完全一致）
+        uses: actions/upload-artifact@v6
         with:
           name: PopDownloader-Windows-${{ github.ref_type == 'tag' && github.ref_name || github.run_number }}
           path: staging/*

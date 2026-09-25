@@ -34,6 +34,7 @@
     "@ffmpeg-installer/ffmpeg": "^1.1.0",
     "@vicons/ionicons5": "^0.13.0",
     "archiver": "^7.0.1",
+    "archiver-utils": "*",
     "better-sqlite3": "^12.9.0",
     "express": "^5.2.1",
     "flac-tagger": "^2.0.0",
@@ -60,7 +61,7 @@
       "dist/**/*",
       "server/**/*",
       "electron/**/*",
-      "scripts/ci-runtime-probe.js",
+      "scripts/**/*",
       "package.json"
     ],
     "win": {

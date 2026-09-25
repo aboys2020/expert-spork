@@ -50,9 +50,18 @@ async function main() {
   report(`electron=${process.versions.electron} node=${process.versions.node} modules=${process.versions.modules}`)
   report(`cwd=${process.cwd()} __dirname=${__dirname}`)
 
-  // 1) 定位 app.asar：正常情况下 __dirname 形如
-  //    <...>\resources\app.asar\scripts
-  const asarPath = __dirname.replace(/[\\/]scripts$/, '')
+  // 1) 定位 app.asar。优先用 Electron 的 app.getAppPath()，它直接给出应用根路径；
+  //    退化方案是按 __dirname 去掉结尾的 scripts。
+  let asarPath = null
+  try {
+    const electron = require('electron')
+    if (electron && typeof electron.app?.getAppPath === 'function') {
+      asarPath = electron.app.getAppPath()
+    }
+  } catch {}
+  if (!asarPath) {
+    asarPath = __dirname.replace(/[\\/]scripts$/, '')
+  }
   report(`asar=${asarPath}`)
   report(`asar exists=${step('fs.existsSync(asar)', () => fs.existsSync(asarPath))}`)
 
@@ -67,6 +76,46 @@ async function main() {
     report('__PROBE_DONE__')
     return
   }
+
+  // 2b) 逐个显式 require 所有第三方依赖。
+  //
+  // 为什么必须做：曾经出现过这样的真实故障 —— zip-stream 在顶层、archiver-utils 被
+  // npm 提升冲突挤进 archiver/node_modules/，于是 zip-stream 里的
+  // require('archiver-utils') 解析不到。archiver 模块本身能加载、server/index.js 也能
+  // 加载，只有真正 require('archiver') 时才炸，导致坏包流到了用户手里。
+  // 这里逐个 require 一遍，把这类问题挡在 CI 阶段。
+  const requiredModules = []
+  for (const name of [
+    'express',
+    'archiver',
+    'archiver-utils',
+    'zip-stream',
+    'compress-commons',
+    'better-sqlite3',
+    'fluent-ffmpeg',
+    '@ffmpeg-installer/ffmpeg',
+  ]) {
+    const ok = step(`require('${name}')`, () => {
+      require(name)
+      return 'ok'
+    })
+    if (ok !== undefined) {
+      requiredModules.push(name)
+    }
+  }
+  report(`已成功 require ${requiredModules.length} 个第三方模块`)
+
+  // 2c) 完整加载 archiver 的依赖链。
+  //     实测：require('archiver') 会连锁加载 archiver/lib/plugins/zip -> zip-stream，
+  //     真正的报错来自 zip-stream 内部的 require('archiver-utils')，所以这一条是关键校验。
+  step('require(archiver) 完整加载链', () => {
+    const archiverEntry = require.resolve('archiver')
+    const archiver = require(archiverEntry)
+    if (typeof archiver !== 'function' && typeof archiver.create !== 'function') {
+      throw new Error('archiver 导出形状异常')
+    }
+    return 'archiver 可用'
+  })
 
   // server/index.js 通过 app.listen 异步监听，这里轮询确认真能服务
   const base = `http://127.0.0.1:${port}`
