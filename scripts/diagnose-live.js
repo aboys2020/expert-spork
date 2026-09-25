@@ -23,8 +23,45 @@
 const fs = require('fs')
 const path = require('path')
 
-let sessionId = process.argv[2] || ''
-const trackId = process.argv[3] || ''
+/**
+ * 参数解析：兼容两种写法，避免因空字符串被当成「未提供」而误判。
+ *   diagnose-live.js <track_id>
+ *   diagnose-live.js <sessionid> <track_id>
+ *   diagnose-live.js "" <track_id>          （sessionid 留空时自动读取本机登录态）
+ *
+ * 注意：必须用 `typeof x === 'string'` 判断而不是 `x || default`，
+ * 因为用户常把 sessionid 写成空字符串 ""，用 || 会把它当成未提供。
+ */
+function parseArgs(argv) {
+  const positional = argv.slice(2)
+  const first = typeof positional[0] === 'string' ? positional[0].trim() : ''
+  const second = typeof positional[1] === 'string' ? positional[1].trim() : ''
+
+  if (first && second) {
+    return { explicitSession: first, track: second }
+  }
+  if (first && !second) {
+    // 只给了一个参数：按 track_id 解释，sessionid 走自动读取
+    return { explicitSession: '', track: first }
+  }
+  if (!first && second) {
+    // 第一个是空串（sessionid 留空）
+    return { explicitSession: '', track: second }
+  }
+  return { explicitSession: '', track: '' }
+}
+
+const parsed = parseArgs(process.argv)
+let sessionId = parsed.explicitSession
+const trackId = parsed.track
+// 可选的音质过滤：只测指定音质（逗号分隔），不传则测全部
+const qualityFilter = (() => {
+  const raw = typeof process.argv[4] === 'string' ? process.argv[4].trim() : ''
+  if (!raw) {
+    return null
+  }
+  return raw.split(',').map((s) => s.trim()).filter(Boolean)
+})()
 
 /** 不传 sessionid 时，复用应用自身的「一键登录」读取逻辑 */
 function resolveSessionId() {
@@ -77,10 +114,14 @@ function toText(result) {
 }
 
 async function viaHttp() {
+  const body = { sessionid: sessionId, track_id: trackId, confirm: true }
+  if (qualityFilter) {
+    body.qualities = qualityFilter
+  }
   const res = await fetch('http://localhost:3001/api/diagnose/track-quality', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ sessionid: sessionId, track_id: trackId, confirm: true }),
+    body: JSON.stringify(body),
   })
   const text = await res.text()
   let json = null
@@ -92,14 +133,24 @@ async function viaHttp() {
 
 async function viaModule() {
   const { diagnoseTrackMedia } = require('../server/utils/track-download')
-  const result = await diagnoseTrackMedia({ sessionid: sessionId, track_id: trackId })
+  const result = await diagnoseTrackMedia({
+    sessionid: sessionId,
+    track_id: trackId,
+    qualities: qualityFilter,
+  })
   return { status: 200, json: { message: 'success', data: result }, text: '' }
 }
 
 async function main() {
   if (!trackId) {
     console.log('用法: diagnose-live.js [sessionid] <track_id>')
-    console.log('sessionid 可省略：省略时会读取本机汽水音乐登录态（需要本机已登录）。')
+    console.log('  sessionid 可省略：省略时会读取本机汽水音乐登录态（需要本机已登录）。')
+    console.log('  示例（sessionid 留空）:')
+    console.log('    diagnose-live.js "" 7665560323298887720')
+    console.log('  示例（只给 track_id）:')
+    console.log('    diagnose-live.js 7665560323298887720')
+    console.log('  可选第 3 个参数指定音质，例如只测 lossless:')
+    console.log('    diagnose-live.js "" 7665560323298887720 lossless')
     return
   }
 
