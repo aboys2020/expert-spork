@@ -197,14 +197,14 @@ git push origin HEAD --tags
 > 构建完成后在该次运行页面底部下载 Artifact。
 
 工作流会自动完成：`npm ci` → 初始化 MSVC 环境 → 为 Electron 重建 `better-sqlite3`
-（优先取预编译包，取不到再源码编译）→ `vite build` → `electron-builder --win` →
+（优先取预编译包，取不到再源码编译）→ `vite build` → `electron-builder --win --publish never` →
 **启动打好的 exe 做冒烟测试**（探测 `/api/health` 与前端入口，防止打出能编译但一打开就崩的包）
 → 上传产物。
 
 > 注意：exe 体积接近百 MB，超过 GitHub 单文件 100MB 的入库限制，
 > 所以产物只作为 Release 附件 / Artifact 分发，不要提交进仓库。
 
-#### 两个容易踩的坑（已修复，改动前请先看）
+#### 三个容易踩的坑（均已修复，改动前请先看）
 
 1. **runner 必须固定在 `windows-2022`，不要改成 `windows-latest`。**
    `windows-latest` 标签现已指向「Windows Server 2025 + Visual Studio 2026」镜像
@@ -215,6 +215,12 @@ git push origin HEAD --tags
    原先的 `postinstall: electron-builder install-app-deps` 会让 `npm ci` 阶段就触发原生模块编译，
    工具链一旦有问题，失败点会伪装成「npm ci 失败」，很误导。
    现在重建集中在工作流的专用步骤里，失败原因一眼可见。
+3. **`npm run dist` 必须带 `--publish never`。**
+   electron-builder 只要检测到 CI 环境就会自动开启发布（日志里的 `reason=CI detected`），
+   没有 `GH_TOKEN` 时直接报 `GitHub Personal Access Token is not set` 并以退出码 1 结束
+   ——**哪怕 exe 其实已经打包成功**。
+   更要留神：本项目的 `repository.url` 指向原作者仓库，若为消错而补上 token，
+   反而可能把 Release 发到别人的仓库。发布统一交给 `softprops/action-gh-release` 负责。
 
 ⚠️ 工作流文件走的是「该 tag 所指向的那次提交」里的版本。改了工作流之后，
 **必须先把改动提交并推送，再打 tag**，否则跑的仍是旧工作流。

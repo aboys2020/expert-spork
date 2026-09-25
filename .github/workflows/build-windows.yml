@@ -104,8 +104,13 @@ jobs:
           }
 
       - name: Build frontend & package
-        # dist 脚本 = vite build && electron-builder --win
-        # dist/ 被 .gitignore 忽略，所以必须先构建，electron-builder 的 files 才能取到前端资源
+        # dist 脚本 = vite build && electron-builder --win --publish never
+        # dist/ 被 .gitignore 忽略，所以必须先构建，electron-builder 的 files 才能取到前端资源。
+        # 【重要】--publish never 不能去掉：electron-builder 只要检测到 CI 环境就会自动开启发布
+        # （日志里的 reason=CI detected），没有 GH_TOKEN 就直接报错并以退出码 1 结束——即使 exe
+        # 其实已经打包成功。而本项目 repository.url 指向原作者仓库 SaKongA/PopDownloader，
+        # 一旦补上 token 反而可能把 Release 发到别人的仓库去。
+        # 发布由下面的 softprops/action-gh-release 步骤负责，这里只管打包。
         run: npm run dist
 
       - name: Smoke test packaged app
