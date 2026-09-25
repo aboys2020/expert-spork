@@ -211,7 +211,16 @@ git push origin HEAD --tags
 | 阶段 | 做什么 | 失败意味着 |
 | --- | --- | --- |
 | 1 | `ELECTRON_RUN_AS_NODE=1` 运行打包后的 exe，加载 `app.asar` 内的 `server/index.js` 并真正监听端口（`scripts/ci-runtime-probe.js`），**不需要 GUI** | 打包内容有问题：原生模块 ABI 不匹配、asar 遗漏、依赖缺失 —— **这是用户真会遇到的问题，必须修** |
-| 2 | 用 `--no-sandbox --disable-gpu` 启动 GUI 产物，探测 `/api/health` 与前端入口 | 打包内容没问题，卡在 GUI 启动环节（无头会话限制） |
+| 2 | 用 `--no-sandbox --disable-gpu` 启动 GUI 产物，探测 `/api/health` 与前端入口 | 打包内容没问题，卡在 GUI 启动环节（见下） |
+
+**阶段 2 默认是非阻断的**（只告警，不影响构建成功），因为 Electron 官方文档明确说明它依赖显示驱动：
+无头环境下浏览器进程可能无法就绪，此时 `app.whenReady()` 永不触发。实测在 GitHub hosted runner 上
+就是这个表现（心跳停在 `main.js 已进入` 之后，`app ready` 从未出现），而阶段 1 已经证明产物完好。
+本机真机验证时可用严格模式：
+
+```powershell
+$env:GUI_CHECK_BLOCKING='true'; node scripts/ci-smoke-test.js
+```
 
 > ⚠️ **Windows 上 Electron 的 GUI 进程没有控制台，主进程里 `console.log` 的内容会被直接丢弃**，
 > 所以捕获 GUI 进程的 stdout/stderr 永远是空的、没有诊断价值。

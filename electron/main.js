@@ -53,13 +53,25 @@ function createWindow() {
   waitForServerThenLoad()
 }
 
+function loadIntoWindow() {
+  // 防御：等待后端的过程中窗口可能已被关闭，此时 win 为 null，
+  // 原来的 win.loadURL() 会抛未捕获异常。
+  if (!win || win.isDestroyed()) {
+    heartbeat('窗口已不存在，跳过 loadURL')
+    return
+  }
+  win.loadURL(BASE).catch((err) => {
+    heartbeat(`loadURL 失败：${err && err.message ? err.message : err}`)
+  })
+}
+
 // 后端 listen 是异步的，先轮询就绪再 loadURL，避免白屏
 function waitForServerThenLoad() {
   const tryLoad = (attempt) => {
     const req = http.get(BASE, (res) => {
       res.destroy()
       heartbeat(`后端就绪，loadURL（第 ${attempt + 1} 次探测）`)
-      win.loadURL(BASE)
+      loadIntoWindow()
     })
     req.on('error', (err) => {
       if (attempt < 30) {
@@ -67,17 +79,22 @@ function waitForServerThenLoad() {
         setTimeout(() => tryLoad(attempt + 1), 300)
       } else {
         heartbeat('后端 30 次探测均失败，仍尝试 loadURL')
-        win.loadURL(BASE)
+        loadIntoWindow()
       }
     })
   }
   tryLoad(0)
 }
 
-app.whenReady().then(() => {
-  heartbeat('app ready')
-  createWindow()
-})
+app
+  .whenReady()
+  .then(() => {
+    heartbeat('app ready')
+    createWindow()
+  })
+  .catch((err) => {
+    heartbeat(`app.whenReady 失败：${err && err.message ? err.message : err}`)
+  })
 
 app.on('window-all-closed', () => {
   heartbeat('window-all-closed')
