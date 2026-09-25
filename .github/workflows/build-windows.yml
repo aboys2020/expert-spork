@@ -114,8 +114,13 @@ jobs:
         run: npm run dist
 
       - name: Smoke test packaged app
-        # 启动免安装产物，探测 /api/health 与前端入口；
         # 这一步是「原生产物真能跑」的唯一硬校验，不要删。
+        # 分两阶段，目的是把问题性质区分开：
+        #   阶段 1（scripts/ci-runtime-probe.js，以 ELECTRON_RUN_AS_NODE=1 执行打包后的 exe）
+        #     在打包内的 Electron 运行时里加载 app.asar 的 server/index.js 并真正监听端口，
+        #     不需要 GUI。若失败 ⇒ 打包内容本身有问题（ABI / asar / 依赖缺失）。
+        #   阶段 2 才启动 GUI 产物，探测 /api/health 与前端入口。
+        #     若阶段 1 过、阶段 2 失败 ⇒ 问题在「GUI 启动」这一环，而非打包内容。
         run: node scripts/ci-smoke-test.js
 
       - name: Collect deliverables

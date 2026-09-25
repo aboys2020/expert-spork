@@ -60,6 +60,7 @@
       "dist/**/*",
       "server/**/*",
       "electron/**/*",
+      "scripts/ci-runtime-probe.js",
       "package.json"
     ],
     "win": {
