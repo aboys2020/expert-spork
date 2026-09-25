@@ -284,7 +284,7 @@ async function downloadTrackMedia({ sessionid, track_id, quality, aid = fixed.ai
  *
  * 注意：只返回长度与结构参数，绝不返回密钥或 IV 的内容。
  */
-async function diagnoseTrackMedia({ sessionid, track_id, aid = fixed.aid, qualities }) {
+async function diagnoseTrackMedia({ sessionid, track_id, aid = fixed.aid, qualities, onProgress }) {
   const trackPayload = await fetchTrackPayload({ aid, sessionid, track_id })
   const videoModelRaw = trackPayload?.track_player?.video_model
 
@@ -299,6 +299,15 @@ async function diagnoseTrackMedia({ sessionid, track_id, aid = fixed.aid, qualit
     : videoList.map((item) => item?.video_meta?.quality).filter(Boolean))
 
   const report = []
+  // 每采集完一个音质就回调一次，便于调用方即时落盘（中途失败也能留下已完成部分）
+  const push = (entry) => {
+    push(entry)
+    if (typeof onProgress === 'function') {
+      try {
+        onProgress(entry)
+      } catch {}
+    }
+  }
 
   for (const quality of targets) {
     const item = videoList.find((entry) => entry?.video_meta?.quality === quality)
@@ -312,7 +321,7 @@ async function diagnoseTrackMedia({ sessionid, track_id, aid = fixed.aid, qualit
 
     if (!item?.main_url) {
       entry.结论 = '无下载地址，跳过'
-      report.push(entry)
+      push(entry)
       continue
     }
 
@@ -324,7 +333,7 @@ async function diagnoseTrackMedia({ sessionid, track_id, aid = fixed.aid, qualit
       entry.HTTP状态 = response.status
       if (!response.ok) {
         entry.结论 = `下载失败：HTTP ${response.status}`
-        report.push(entry)
+        push(entry)
         continue
       }
 
@@ -342,7 +351,7 @@ async function diagnoseTrackMedia({ sessionid, track_id, aid = fixed.aid, qualit
 
       if (moov.isEmpty()) {
         entry.结论 = '容器里没有 moov，不是预期格式'
-        report.push(entry)
+        push(entry)
         continue
       }
 
@@ -376,7 +385,7 @@ async function diagnoseTrackMedia({ sessionid, track_id, aid = fixed.aid, qualit
         entry.senc声明样本数 = senc.data.length >= 8 ? senc.data.readUInt32BE(4) : '未知'
       } else {
         entry.结论 = '没有 senc box（未按预期加密）'
-        report.push(entry)
+        push(entry)
         continue
       }
 
@@ -404,7 +413,7 @@ async function diagnoseTrackMedia({ sessionid, track_id, aid = fixed.aid, qualit
       entry.错误 = error.message
     }
 
-    report.push(entry)
+    push(entry)
   }
 
   return { track_id, qualities: targets, report }

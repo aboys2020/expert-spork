@@ -50,6 +50,21 @@ function createWindow() {
     win = null
     heartbeat('窗口已关闭')
   })
+
+  // Electron 默认不绑定 F12，这里手动绑定一个开发者工具开关，便于排查问题。
+  // 同时绑定 Ctrl+Shift+I 作为备选。
+  win.webContents.on('before-input-event', (_event, input) => {
+    if (input.type !== 'keyDown') {
+      return
+    }
+    const isF12 = input.key === 'F12'
+    const isCtrlShiftI = input.control && input.shift && String(input.key).toLowerCase() === 'i'
+    if (isF12 || isCtrlShiftI) {
+      win.webContents.toggleDevTools()
+    }
+  })
+
+  heartbeat('已绑定 F12 开发者工具')
   waitForServerThenLoad()
 }
 
