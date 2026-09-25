@@ -11,8 +11,7 @@
     "start": "node server/index.js",
     "pack": "electron-builder --dir",
     "dist": "npm run build && electron-builder --win",
-    "rebuild:native": "electron-builder install-app-deps",
-    "postinstall": "electron-builder install-app-deps"
+    "rebuild:native": "electron-builder install-app-deps"
   },
   "repository": {
     "type": "git",

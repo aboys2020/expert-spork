@@ -168,6 +168,11 @@ npm run dist
 
 产物在 `release/` 目录（已加入 `.gitignore`，不提交进仓库）。
 
+> `better-sqlite3` 是原生模块：本地执行过 `npm run dist` 之后，`node_modules` 里它的二进制
+> 会变成 Electron ABI 的版本，此时再单独跑 `npm run start`（用系统 Node）可能报 ABI 不匹配。
+> 需要切回来时执行一次 `npm run rebuild:native` 对应的反向重建，或重新 `npm ci` 即可；
+> 正常走 `npm run dev` / `npm run dist` 不受影响。
+
 ### 用 GitHub Actions 云端打包
 
 仓库内置工作流 [.github/workflows/build-windows.yml](.github/workflows/build-windows.yml)，
@@ -191,12 +196,28 @@ git push origin HEAD --tags
 > 不想打 tag 也可以：到仓库 **Actions → Build Windows Package → Run workflow** 手动跑一次，
 > 构建完成后在该次运行页面底部下载 Artifact。
 
-工作流会自动完成：`npm ci` → 为 Electron 重编译 `better-sqlite3` → `vite build` →
-`electron-builder --win` → **启动打好的 exe 做冒烟测试**（探测 `/api/health` 与前端入口，
-防止打出能编译但一打开就崩的包）→ 上传产物。
+工作流会自动完成：`npm ci` → 初始化 MSVC 环境 → 为 Electron 重建 `better-sqlite3`
+（优先取预编译包，取不到再源码编译）→ `vite build` → `electron-builder --win` →
+**启动打好的 exe 做冒烟测试**（探测 `/api/health` 与前端入口，防止打出能编译但一打开就崩的包）
+→ 上传产物。
 
 > 注意：exe 体积接近百 MB，超过 GitHub 单文件 100MB 的入库限制，
 > 所以产物只作为 Release 附件 / Artifact 分发，不要提交进仓库。
+
+#### 两个容易踩的坑（已修复，改动前请先看）
+
+1. **runner 必须固定在 `windows-2022`，不要改成 `windows-latest`。**
+   `windows-latest` 标签现已指向「Windows Server 2025 + Visual Studio 2026」镜像
+   （见 [actions/runner-images 标签映射表](https://github.com/actions/runner-images)）。
+   `better-sqlite3` 依赖的 `node-gyp` 探测不到 VS 2026，会报
+   `Could not find any Visual Studio installation to use`，导致原生模块重建失败、直接中断构建。
+2. **`package.json` 里刻意不保留 `postinstall`。**
+   原先的 `postinstall: electron-builder install-app-deps` 会让 `npm ci` 阶段就触发原生模块编译，
+   工具链一旦有问题，失败点会伪装成「npm ci 失败」，很误导。
+   现在重建集中在工作流的专用步骤里，失败原因一眼可见。
+
+⚠️ 工作流文件走的是「该 tag 所指向的那次提交」里的版本。改了工作流之后，
+**必须先把改动提交并推送，再打 tag**，否则跑的仍是旧工作流。
 
 ## 📁 项目结构
 

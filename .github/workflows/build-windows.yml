@@ -24,7 +24,13 @@ jobs:
     name: Build & Verify (Windows)
     # electron-builder --win 必须在 Windows runner 上跑；
     # Linux runner 需要额外装 Wine，稳定性差，不要换。
-    runs-on: windows-latest
+    #
+    # 【重要】这里必须显式写 windows-2022，不要改回 windows-latest！
+    # windows-latest 标签现已指向「Windows Server 2025 + Visual Studio 2026」镜像
+    # （见 actions/runner-images README 的标签映射表），而 better-sqlite3 依赖的 node-gyp
+    # 探测不到 VS 2026，会直接报 "Could not find any Visual Studio installation to use"。
+    # windows-2022 对应 VS 2022，工具链能被 node-gyp 正确识别。
+    runs-on: windows-2022
     timeout-minutes: 45
 
     env:
@@ -33,26 +39,54 @@ jobs:
       CSC_IDENTITY_AUTO_DISCOVERY: 'false'
 
     steps:
+      # 注：checkout / setup-node 用 v5，它们运行在 node24 上。
+      # v4 运行在已弃用的 node20 上，会刷 "Node.js 20 is deprecated" 警告。
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '22'
           cache: npm
 
       - name: Install dependencies
-        # 用 npm ci 严格按 package-lock.json 安装，保证 CI 与本地一致
+        # 用 npm ci 严格按 package-lock.json 安装，保证 CI 与本地一致。
+        # 注意：package.json 里已不含 postinstall，这一步不会触发原生模块重编译，
+        # 避免在「装依赖」阶段就因工具链问题中断，把失败点收敛到下面的专用步骤。
         run: npm ci
 
+      - name: Setup MSVC developer environment
+        # 显式初始化 VS x64 开发者环境（vcvars）。node-gyp 依赖它定位 MSVC 与 Windows SDK。
+        # 若 runner 上确实缺少 VS 构建工具，这一步会立刻给出明确报错，
+        # 而不是等到 node-gyp 深处才暴露。
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Rebuild native modules for Electron
-        # 关键步骤：better-sqlite3 是原生模块，npm ci 装出的是「系统 Node」的二进制，
-        # 必须针对 Electron 的 ABI 重新编译/下载预编译包，否则 exe 能打包成功但一运行就崩。
-        # 说明：install-app-deps 只支持 --platform / --arch 参数（不要加 --only，会被静默忽略）；
-        # 它会自动跳过没有 node-gyp 构建目标的包（如按平台分发的 @ffmpeg-installer/ffmpeg）。
-        # 这里的 postinstall 已经跑过一次，此处显式再跑一次作为兜底，且幂等。
-        run: npm run rebuild:native
+        # better-sqlite3 是原生模块，npm ci 拿到的是「系统 Node」的二进制，
+        # 必须换成针对 Electron ABI 的版本，否则 exe 能打包成功但一运行就崩。
+        #
+        # 双保险策略：
+        #   A. 先让 prebuild-install 下载 Electron 33 的预编译包（几秒完成，完全不需要编译器）
+        #   B. 若没有预编译包，再用 electron-builder install-app-deps 走 @electron/rebuild 源码编译
+        # 最后以 B 的结果为准，因为 electron-builder 打包时自身也会做一次 rebuild，两者必须一致。
+        # 说明：install-app-deps 只支持 --platform / --arch（不要加 --only，会被静默忽略）。
+        shell: pwsh
+        run: |
+          $electronVersion = (Get-Content node_modules/electron/package.json -Raw | ConvertFrom-Json).version
+          Write-Host "Electron 版本: $electronVersion"
+          Write-Host "--- A. 尝试下载 Electron 预编译包 ---"
+          try {
+            & npx --no-install prebuild-install --runtime electron --target $electronVersion --arch x64 --platform win32
+            if ($LASTEXITCODE -eq 0) { Write-Host "预编译包已就绪（无需编译）" }
+            else { Write-Host "未取到预编译包，将回退到源码编译" }
+          } catch {
+            Write-Host "prebuild-install 执行异常，将回退到源码编译：$($_.Exception.Message)"
+          }
+          Write-Host "--- B. electron-builder 重建（源码编译兜底）---"
+          npm run rebuild:native
 
       - name: Verify tag matches package.json version
         # 防止出现 v1.2.0 的 tag 打出 1.0.0 的包这种低级事故
@@ -96,7 +130,7 @@ jobs:
           }
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: PopDownloader-Windows-${{ github.ref_type == 'tag' && github.ref_name || github.run_number }}
           path: staging/*
