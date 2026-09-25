@@ -141,6 +141,15 @@ class TrackDecryptor {
     const chunkCount = stco.data.readUInt32BE(4)
     const ivs = parseSenc(senc.data)
 
+    // 显式校验 key/IV 长度，避免 crypto 层抛出难以定位的原生报错
+    if (!Buffer.isBuffer(key) || key.length !== 16) {
+      throw new Error(`解密密钥长度异常：期望 16 字节，实际 ${key ? key.length : 0} 字节。`)
+    }
+
+    if (ivs.some((iv) => !Buffer.isBuffer(iv) || iv.length !== 16)) {
+      throw new Error('解密 IV 长度异常：期望每个 IV 为 16 字节。')
+    }
+
     if (sampleSizes.length !== ivs.length) {
       throw new Error(`Decrypt failed: sample count ${sampleSizes.length} does not match iv count ${ivs.length}.`)
     }

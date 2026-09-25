@@ -155,16 +155,63 @@ function parseStsc(data) {
   return entries
 }
 
+/**
+ * 解析 senc（Sample Encryption）box，取出每个样本的 IV。
+ *
+ * 关键：IV 大小不是固定的 8 字节，而是写在 senc 的 flags 里（CENC 规范）：
+ *   bit 0        : override_track_encryption_box_parameters
+ *   bit 1        : use_subsample_encryption
+ *   bit 2        : pattern（仅 cbcs）
+ *   bits 4..7    : pattern 相关
+ *   bits 8..13   : per_sample_iv_size（低 6 位，取值 0 / 8 / 16）
+ * 注意 per_sample_iv_size 占 6 位而非 4 位，用 0x0f 遮罩会把 16(0x10) 之外的位算错、
+ * 也会把 subsample 位混进来（踩过这个坑）。
+ * 原先实现硬编码按 8 字节步进，遇到 16 字节 IV 的流时，读到后面 position 会越过
+ * box 末尾，Buffer.copy 抛出的正是 "Attempt to access memory outside buffer bounds"
+ * （真实案例：某曲目 lossless 下载失败，只给出这一句，无法定位）。
+ */
 function parseSenc(data) {
+  const versionFlags = readUInt32Checked(data, 0, 'senc')
+  const version = (versionFlags >>> 24) & 0xff
+  const flags = versionFlags & 0xffffff
   const count = readUInt32Checked(data, 4, 'senc')
 
-  // 默认 IV 为 8 字节；每项可能还带 2 字节 subsample 计数 + 6 字节子样本数据，
-  // 这里按最常见的 8 字节 IV 计算最小需求量。
-  const ivSize = 8
-  const minEnd = 8 + count * ivSize
+  const hasSubsamples = (flags & 0x02) !== 0
+  const declaredIvSize = (flags >> 8) & 0x3f
+
+  // per_sample_iv_size 是 version 1 才有的字段。version 0 的 box 里该位不可信
+  // （常见情况是 flags=0，但每个条目后面仍跟着 8 字节 IV）。
+  // 若直接采信 0，就会把 IV 解析成全零 —— 那会把原本能正常下载的曲目解成噪音，
+  // 属于比原 bug 更严重的回归，所以这里必须区分版本处理。
+  let ivSize = declaredIvSize
+  if (![0, 8, 16].includes(declaredIvSize)) {
+    throw new Error(
+      `senc 解析失败：flags 声明了异常的 IV 大小 ${declaredIvSize} 字节` +
+        `（version=${version} flags=0x${flags.toString(16)}）。本工具只支持规范定义的 0 / 8 / 16。`,
+    )
+  }
+
+  if (version === 0) {
+    // per_sample_iv_size 是 version 1 才有的字段。version 0 的 box 里该位不可信
+    // （常见情况是 flags=0，但每个条目后面仍跟着 8 字节 IV）。
+    // 若直接采信 0，就会把 IV 解析成全零 —— 那会把原本能正常下载的曲目解成噪音，
+    // 属于比原 bug 更严重的回归，所以这里按条目布局反推。
+    const ivPerSample = 8 + (hasSubsamples ? 2 : 0)
+    const remaining = data.length - 8
+    if (remaining === count * ivPerSample) {
+      ivSize = 8
+    }
+  }
+
+  const entryBytes = ivSize + (hasSubsamples ? 2 : 0)
+  const minEnd = 8 + count * entryBytes
+
   if (minEnd > data.length) {
     throw new Error(
-      `senc 解析失败：声明 ${count} 个 IV 至少需要 ${minEnd} 字节，但该 box 只有 ${data.length} 字节`,
+      `senc 解析失败：version=${version} flags=0x${flags.toString(16)}` +
+        `（IV 大小=${ivSize} 字节，subsample=${hasSubsamples ? '有' : '无'}），` +
+        `声明 ${count} 个样本至少需要 ${minEnd} 字节，但该 box 只有 ${data.length} 字节。` +
+        '这通常意味着该曲目的加密方式（IV 长度/子样本）与当前解析假设不符。',
     )
   }
 
@@ -173,9 +220,17 @@ function parseSenc(data) {
 
   for (let index = 0; index < count; index += 1) {
     const iv = Buffer.alloc(16)
-    data.copy(iv, 0, position, position + ivSize)
+    if (ivSize > 0) {
+      data.copy(iv, 0, position, position + ivSize)
+      position += ivSize
+    }
+
+    if (hasSubsamples) {
+      // 子样本计数占用 2 字节，这里只需跳过；本工具按整样本解密，不使用子样本划分。
+      position += 2
+    }
+
     ivs.push(iv)
-    position += ivSize
   }
 
   return ivs
