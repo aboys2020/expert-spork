@@ -13,6 +13,7 @@ const trackDownloadEncryptedApi = require('./track-download-encrypted')
 const videoV2Api = require('./video-v2')
 const videoDownloadApi = require('./video-download')
 const videoDownloadAudioApi = require('./video-download-audio')
+const diagnoseTrackQualityApi = require('./diagnose-track-quality')
 
 module.exports = [
   healthApi,
@@ -30,4 +31,5 @@ module.exports = [
   videoV2Api,
   videoDownloadApi,
   videoDownloadAudioApi,
+  diagnoseTrackQualityApi,
 ]

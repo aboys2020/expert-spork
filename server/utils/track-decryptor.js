@@ -141,28 +141,62 @@ class TrackDecryptor {
     const chunkCount = stco.data.readUInt32BE(4)
     const ivs = parseSenc(senc.data)
 
+    // 诊断上下文：只记录长度与结构参数，绝不记录密钥或 IV 的内容。
+    // 用于把「无从定位的原生越界报错」变成可直接对照的参数快照
+    // （真实场景：某曲目 lossless 下载失败，而同曲目其他音质正常，
+    //   需要对比两者的容器参数才能定位差异）。
+    const sencFlags = senc.data.length >= 4 ? senc.data.readUInt32BE(0) & 0xffffff : -1
+    const context = {
+      文件总字节: encryptedBuffer.length,
+      mdat数据字节: encryptedBuffer.length - (mdat.offset + 8),
+      样本条数: sampleSizes.length,
+      样本表声明总字节: sampleSizes.reduce((sum, n) => sum + n, 0),
+      IV个数: ivs.length,
+      senc版本: sencFlags >= 0 ? (senc.data.readUInt32BE(0) >>> 24) & 0xff : '未知',
+      senc_flags: sencFlags >= 0 ? `0x${sencFlags.toString(16)}` : '未知',
+      senc声明IV大小: sencFlags >= 0 ? (sencFlags >> 8) & 0x3f : '未知',
+      senc声明有子样本: sencFlags >= 0 ? (sencFlags & 0x02) !== 0 : '未知',
+      senc_box字节: senc.data.length,
+      stsz_box字节: stsz.data.length,
+      stsc_box字节: stsc.data.length,
+      stco_box字节: stco.data.length,
+      判定为FLAC: isFlac,
+      密钥字节: Buffer.isBuffer(key) ? key.length : 0,
+    }
+
+    const withContext = (message) => `${message}\n【诊断参数】${JSON.stringify(context, null, 1)}`
+
     // 显式校验 key/IV 长度，避免 crypto 层抛出难以定位的原生报错
     if (!Buffer.isBuffer(key) || key.length !== 16) {
-      throw new Error(`解密密钥长度异常：期望 16 字节，实际 ${key ? key.length : 0} 字节。`)
+      throw new Error(withContext(`解密密钥长度异常：期望 16 字节，实际 ${key ? key.length : 0} 字节。`))
     }
 
     if (ivs.some((iv) => !Buffer.isBuffer(iv) || iv.length !== 16)) {
-      throw new Error('解密 IV 长度异常：期望每个 IV 为 16 字节。')
+      throw new Error(withContext('解密 IV 长度异常：期望每个 IV 为 16 字节。'))
     }
 
     if (sampleSizes.length !== ivs.length) {
-      throw new Error(`Decrypt failed: sample count ${sampleSizes.length} does not match iv count ${ivs.length}.`)
+      throw new Error(
+        withContext(`Decrypt failed: sample count ${sampleSizes.length} does not match iv count ${ivs.length}.`),
+      )
     }
 
-    const decryptedSamples = this.decryptSampleList({
-      fileBuffer: encryptedBuffer,
-      key,
-      sampleSizes,
-      ivs,
-      mdatOffset: mdat.offset,
-      stscEntries,
-      chunkCount,
-    })
+    let decryptedSamples
+    try {
+      decryptedSamples = this.decryptSampleList({
+        fileBuffer: encryptedBuffer,
+        key,
+        sampleSizes,
+        ivs,
+        mdatOffset: mdat.offset,
+        stscEntries,
+        chunkCount,
+      })
+    } catch (error) {
+      // 把诊断参数附到任何解密阶段错误上，避免只看到一句原生报错
+      error.message = withContext(error.message)
+      throw error
+    }
 
     const outputBuffer = isFlac
       ? this.buildFlacFile(flacMetadata, decryptedSamples)

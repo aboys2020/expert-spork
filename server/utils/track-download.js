@@ -274,7 +274,144 @@ async function downloadTrackMedia({ sessionid, track_id, quality, aid = fixed.ai
   }
 }
 
+/**
+ * 诊断用：对同一首歌的所有音质做「浅层结构分析」，不写出任何文件。
+ *
+ * 为什么要它：真实场景里同一首歌 lossless 下载失败、而 medium/higher/highest 正常，
+ * 四者走的是完全相同的代码路径，唯一变量是上游返回的媒体文件本身。
+ * 逐个手点无法对比，这个函数一次把所有音质的容器参数并列出来，
+ * 差异一眼可见（例如 senc 声明 0 字节 IV、样本表与 mdat 不匹配等）。
+ *
+ * 注意：只返回长度与结构参数，绝不返回密钥或 IV 的内容。
+ */
+async function diagnoseTrackMedia({ sessionid, track_id, aid = fixed.aid, qualities }) {
+  const trackPayload = await fetchTrackPayload({ aid, sessionid, track_id })
+  const videoModelRaw = trackPayload?.track_player?.video_model
+
+  if (!videoModelRaw) {
+    throw new Error('track video_model not found')
+  }
+
+  const videoModel = JSON.parse(videoModelRaw)
+  const videoList = Array.isArray(videoModel?.video_list) ? videoModel.video_list : []
+  const targets = (qualities && qualities.length > 0
+    ? qualities
+    : videoList.map((item) => item?.video_meta?.quality).filter(Boolean))
+
+  const report = []
+
+  for (const quality of targets) {
+    const item = videoList.find((entry) => entry?.video_meta?.quality === quality)
+    const entry = {
+      quality,
+      有下载地址: Boolean(item?.main_url),
+      声明比特率: item?.video_meta?.bitrate ?? null,
+      声明大小: item?.video_meta?.size ?? null,
+      有加密信息: Boolean(item?.encrypt_info?.spade_a),
+    }
+
+    if (!item?.main_url) {
+      entry.结论 = '无下载地址，跳过'
+      report.push(entry)
+      continue
+    }
+
+    try {
+      const response = await fetch(item.main_url, {
+        headers: { 'User-Agent': 'libcurl-agent/1.0' },
+        redirect: 'follow',
+      })
+      entry.HTTP状态 = response.status
+      if (!response.ok) {
+        entry.结论 = `下载失败：HTTP ${response.status}`
+        report.push(entry)
+        continue
+      }
+
+      const encryptedBuffer = Buffer.from(await response.arrayBuffer())
+      entry.实际下载字节 = encryptedBuffer.length
+
+      // 浅层探测：与 TrackDecryptor 使用相同的 box 定位方式，但不做解密
+      const { Mp4Box } = require('./mp4-box')
+      const text = (s, o, e) => Mp4Box.findBox(encryptedBuffer, s, o, e)
+
+      const moov = text('moov', 0, encryptedBuffer.length)
+      const mdat = text('mdat', 0, encryptedBuffer.length)
+      entry.有moov = !moov.isEmpty()
+      entry.有mdat = !mdat.isEmpty()
+
+      if (moov.isEmpty()) {
+        entry.结论 = '容器里没有 moov，不是预期格式'
+        report.push(entry)
+        continue
+      }
+
+      const trak = text('trak', moov.offset + 8, moov.offset + moov.size)
+      const mdia = text('mdia', trak.offset + 8, trak.offset + trak.size)
+      const minf = text('minf', mdia.offset + 8, mdia.offset + mdia.size)
+      const stbl = text('stbl', minf.offset + 8, minf.offset + minf.size)
+      const stsd = text('stsd', stbl.offset + 8, stbl.offset + stbl.size)
+      const stsz = text('stsz', stbl.offset + 8, stbl.offset + stbl.size)
+      const stsc = text('stsc', stbl.offset + 8, stbl.offset + stbl.size)
+      const stco = text('stco', stbl.offset + 8, stbl.offset + stbl.size)
+
+      let senc = text('senc', moov.offset + 8, moov.offset + moov.size)
+      if (senc.isEmpty()) {
+        senc = text('senc', stbl.offset + 8, stbl.offset + stbl.size)
+      }
+
+      entry.box = {
+        stsd: stsd.data.length,
+        stsz: stsz.data.length,
+        stsc: stsc.data.length,
+        stco: stco.data.length,
+        senc: senc.isEmpty() ? 0 : senc.data.length,
+      }
+
+      if (!senc.isEmpty() && senc.data.length >= 4) {
+        const vf = senc.data.readUInt32BE(0)
+        entry.senc版本 = (vf >>> 24) & 0xff
+        entry.senc_flags = `0x${(vf & 0xffffff).toString(16)}`
+        entry.senc声明IV大小 = ((vf & 0xffffff) >> 8) & 0x3f
+        entry.senc声明样本数 = senc.data.length >= 8 ? senc.data.readUInt32BE(4) : '未知'
+      } else {
+        entry.结论 = '没有 senc box（未按预期加密）'
+        report.push(entry)
+        continue
+      }
+
+      entry.mdat数据字节 = mdat.isEmpty() ? 0 : encryptedBuffer.length - (mdat.offset + 8)
+
+      // 尝试完整解密以复现结论（不写文件、不下标签）
+      try {
+        const decryptor = new TrackDecryptor()
+        const result = decryptor.decrypt({
+          encryptedBuffer,
+          spadeA: item?.encrypt_info?.spade_a || '',
+          media: { title: 'diagnose', artist: 'diagnose' },
+        })
+        entry.解密结果 = '成功'
+        entry.输出扩展名 = result.extension
+        entry.输出字节 = result.buffer.length
+        entry.结论 = '正常'
+      } catch (error) {
+        entry.解密结果 = '失败'
+        entry.错误 = error.message
+        entry.结论 = '解密阶段失败'
+      }
+    } catch (error) {
+      entry.结论 = '请求异常'
+      entry.错误 = error.message
+    }
+
+    report.push(entry)
+  }
+
+  return { track_id, qualities: targets, report }
+}
+
 module.exports = {
   getTrackV2Payload,
   downloadTrackMedia,
+  diagnoseTrackMedia,
 }
